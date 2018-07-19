@@ -10,17 +10,48 @@ import (
 
 	"github.com/docopt/docopt-go"
 
+	"bytes"
+	"encoding/json"
 	"github.com/CodisLabs/codis/pkg/topom"
 	"github.com/CodisLabs/codis/pkg/utils"
 	"github.com/CodisLabs/codis/pkg/utils/log"
 	"github.com/CodisLabs/codis/pkg/utils/math2"
-	"github.com/CodisLabs/codis/pkg/utils/redis"
+	"io/ioutil"
+	"net/http"
+	"strings"
 )
+
+type Status int
+
+const (
+	OK Status = iota
+	ERROR
+)
+
+const (
+	IconEmoji      string = ":robot_face:"
+	HealthyEmoji   string = ":good:"
+	UnhealthyEmoji string = ":unhealthy:"
+)
+
+type SlackInfo struct {
+	url             string
+	channel         string
+	userName        string
+	notifyUserNames []string
+}
+
+type SlackPayload struct {
+	Channel   string `json:"channel"`
+	UserName  string `json:"username"`
+	Text      string `json:"text"`
+	IconEmoji string `json:"icon_emoji"`
+}
 
 func main() {
 	const usage = `
 Usage:
-	codis-ha [--log=FILE] [--log-level=LEVEL] [--interval=SECONDS] --dashboard=ADDR [--no-maintains]
+	codis-ha [--log=FILE] [--log-level=LEVEL] [--interval=SECONDS] --dashboard=ADDR [--no-maintains] --slack-url=ADDR --slack-channel=CHANNEL --slack-username=USERNAME --slack-notify-usernames=NOTIFYNAMES
 	codis-ha  --version
 
 Options:
@@ -71,6 +102,13 @@ Options:
 		maintains = false
 	}
 
+	// parse slack info
+	slackInfo := SlackInfo{}
+	slackInfo.url = utils.ArgumentMust(d, "--slack-url")
+	slackInfo.channel = utils.ArgumentMust(d, "--slack-channel")
+	slackInfo.userName = utils.ArgumentMust(d, "--slack-username")
+	slackInfo.notifyUserNames = strings.Split(utils.ArgumentMust(d, "--slack-notify-usernames"), ",")
+
 	client := topom.NewApiClient(dashboard)
 
 	t, err := client.Model()
@@ -89,6 +127,7 @@ Options:
 
 	for {
 		hc := newHealthyChecker(client)
+		hc.slackInfo = &slackInfo
 		hc.LogProxyStats()
 		hc.LogGroupStats()
 		if maintains {
@@ -112,7 +151,18 @@ const (
 	CodeSyncBroken
 )
 
+var codeMapping = map[int]string{
+	CodeAlive:      "CodeAlive",
+	CodeError:      "CodeError",
+	CodeMissing:    "CodeMissing",
+	CodeTimeout:    "CodeTimeout",
+	CodeSyncReady:  "CodeSyncReady",
+	CodeSyncError:  "CodeSyncError",
+	CodeSyncBroken: "CodeSyncBroken",
+}
+
 type HealthyChecker struct {
+	slackInfo *SlackInfo
 	*topom.Stats
 	pstatus map[string]int
 	sstatus map[string]int
@@ -250,13 +300,17 @@ func (hc *HealthyChecker) Maintains(client *topom.ApiClient, maxdown int, auth s
 	for _, p := range hc.Proxy.Models {
 		switch hc.pstatus[p.Token] {
 		case CodeError, CodeTimeout, CodeMissing:
-			log.Warnf("try to remove proxy-[%s]", p.AdminAddr)
-			if err := client.RemoveProxy(p.Token, true); err != nil {
-				log.ErrorErrorf(err, "call rpc remove-proxy to dashboard %s failed", p.AdminAddr)
+			sendSlackMessage(hc.slackInfo, ERROR,
+				fmt.Sprintf("proxy is broken, product name:%s, addr:%s, token:%s, code:%s", p.ProductName, p.ProxyAddr, p.Token, codeMapping[hc.pstatus[p.Token]]))
+			/*
+				log.Warnf("try to remove proxy-[%s]", p.AdminAddr)
+				if err := client.RemoveProxy(p.Token, true); err != nil {
+					log.ErrorErrorf(err, "call rpc remove-proxy to dashboard %s failed", p.AdminAddr)
+					return
+				}
+				log.Warnf("try to remove proxy done.")
 				return
-			}
-			log.Warnf("try to remove proxy done.")
-			return
+			*/
 		default:
 			continue
 		}
@@ -272,6 +326,8 @@ Groups:
 					switch hc.sstatus[g.Servers[0].Addr] {
 					case CodeError, CodeMissing, CodeTimeout, CodeSyncError:
 						log.Warnf("codis-server (master) %s state error", x.Addr)
+						sendSlackMessage(hc.slackInfo, ERROR,
+							fmt.Sprintf("codis server(master) is broken, group:%d, addr:%s, code:%s", g.Id, g.Servers[0].Addr, codeMapping[hc.sstatus[g.Servers[0].Addr]]))
 						break Groups
 					default:
 						continue
@@ -282,29 +338,35 @@ Groups:
 			}
 			// remove codis server(slave and only one master) which state is not right
 			switch hc.sstatus[x.Addr] {
-			case CodeError, CodeMissing, CodeTimeout, CodeSyncError:
-				log.Warnf("try to group-del-server to dashboard %s", x.Addr)
-				if err := client.GroupDelServer(g.Id, x.Addr); err != nil {
-					log.ErrorErrorf(err, "call rpc group-del-server to dashboard %s failed", x.Addr)
-					return
-				}
-				log.Debugf("call rpc group-del-server OK")
+			/*
+				case CodeError, CodeMissing, CodeTimeout, CodeSyncError:
+					log.Warnf("try to group-del-server to dashboard %s", x.Addr)
+					if err := client.GroupDelServer(g.Id, x.Addr); err != nil {
+						log.ErrorErrorf(err, "call rpc group-del-server to dashboard %s failed", x.Addr)
+						return
+					}
+					log.Debugf("call rpc group-del-server OK")
 
-				// trt to shutdown codis-server as slave in error state
-				log.Warnf("try to shutdown codis-server(slave) %s", x.Addr)
-				c, err := redis.NewClient(x.Addr, auth, time.Minute*30)
-				if err != nil {
-					log.WarnErrorf(err, "connect to codis-server(slave) %s failed", x.Addr)
+					// trt to shutdown codis-server as slave in error state
+					log.Warnf("try to shutdown codis-server(slave) %s", x.Addr)
+					c, err := redis.NewClient(x.Addr, auth, time.Minute*30)
+					if err != nil {
+						log.WarnErrorf(err, "connect to codis-server(slave) %s failed", x.Addr)
+						return
+					}
+					defer c.Close()
+					if err := c.Shutdown(); err != nil {
+						log.WarnErrorf(err, "try to shutdown codis-server %s failed", x.Addr)
+						return
+					}
 					return
-				}
-				defer c.Close()
-				if err := c.Shutdown(); err != nil {
-					log.WarnErrorf(err, "try to shutdown codis-server %s failed", x.Addr)
-					return
-				}
-				return
-			case CodeSyncBroken:
-				log.Warnf("slave %s master link down", x.Addr)
+				case CodeSyncBroken:
+					log.Warnf("slave %s master link down", x.Addr)
+			*/
+			case CodeError, CodeMissing, CodeTimeout, CodeSyncError, CodeSyncBroken:
+				msg := fmt.Sprintf("codis server(slave) is broken, group:%d, addr:%s, code:%s", g.Id, x.Addr, codeMapping[hc.sstatus[x.Addr]])
+				log.Warnf(msg)
+				sendSlackMessage(hc.slackInfo, ERROR, msg)
 			default:
 				continue
 			}
@@ -316,6 +378,9 @@ Groups:
 		if len(g.Servers) != 0 {
 			switch hc.sstatus[g.Servers[0].Addr] {
 			case CodeMissing, CodeError, CodeTimeout:
+				sendSlackMessage(hc.slackInfo, ERROR,
+					fmt.Sprintf("codis server(master) is broken, prepare to failover, group:%d, addr:%s, code:%s",
+						g.Id, g.Servers[0].Addr, codeMapping[hc.sstatus[g.Servers[0].Addr]]))
 				var synced int
 				var picked, picked2 = 0, 0
 				var mindown, mindown2 = maxdown + 1, 65535
@@ -347,8 +412,13 @@ Groups:
 				switch {
 				case picked == 0 && picked2 == 0:
 					log.Warnf("try to promote group-[%d], but synced = %d & picked = %d & picked2 = %d, giveup", g.Id, synced, picked, picked2)
+					sendSlackMessage(hc.slackInfo, ERROR,
+						fmt.Sprintf("codis server(master) failover failed, no good slave available"))
+					//fmt.Sprintf("codis server(master) failover failed, no good slave available, group:%d,addr:%s", g.Id, g.Servers[0].Addr))
 				case g.Promoting.State != "":
 					log.Warnf("try to promote group-[%d], but group is promoting = %s, please fix it manually", g.Id, g.Promoting.State)
+					sendSlackMessage(hc.slackInfo, ERROR,
+						fmt.Sprintf("codis server(master) failover failed, group id promoting, group:%d,addr:%s", g.Id, g.Servers[0].Addr))
 				case picked > 0 || picked2 > 0:
 					var pick int
 					if picked > 0 {
@@ -362,8 +432,63 @@ Groups:
 						log.ErrorErrorf(err, "rpc promote server failed")
 					}
 					log.Warnf("done.")
+					sendSlackMessage(hc.slackInfo, OK,
+						fmt.Sprintf("codis server(master) failover done, group:%d, addr:%s-->%s", g.Id, g.Servers[0].Addr, slave))
 				}
 			}
 		}
 	}
+}
+
+func sendSlackMessage(slackInfo *SlackInfo, status Status, message string) {
+	// build request
+	payload := SlackPayload{
+		Channel:   slackInfo.channel,
+		UserName:  slackInfo.userName,
+		IconEmoji: IconEmoji,
+	}
+
+	emoji := UnhealthyEmoji
+	if status == OK {
+		emoji = HealthyEmoji
+	}
+
+	notifyUsers := make([]string, 0, len(slackInfo.notifyUserNames))
+	for _, userName := range slackInfo.notifyUserNames {
+		notifyUsers = append(notifyUsers, fmt.Sprintf("<@%s>", userName))
+	}
+
+	payload.Text = fmt.Sprintf("%s %s %s", emoji, message, strings.Join(notifyUsers, ","))
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Warnf("json marshal failed, err:%s", err)
+		return
+	}
+
+	// send request
+	req, err := http.NewRequest("POST", slackInfo.url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Warnf("new http request failed, err:%s", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	rsp, err := client.Do(req)
+	if err != nil {
+		log.Warnf("do http request failed, err:%s", err)
+		return
+	}
+	defer rsp.Body.Close()
+
+	// process response
+	log.Infof("response status code:%s", rsp.Status)
+	body, err := ioutil.ReadAll(rsp.Body)
+	if err != nil {
+		log.Warnf("read http response body failed, err:%s", err)
+		return
+	}
+	log.Infof("response body:%s", string(body))
 }
