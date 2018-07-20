@@ -12,6 +12,7 @@ import (
 
 	"bytes"
 	"encoding/json"
+	"github.com/CodisLabs/codis/pkg/models"
 	"github.com/CodisLabs/codis/pkg/topom"
 	"github.com/CodisLabs/codis/pkg/utils"
 	"github.com/CodisLabs/codis/pkg/utils/log"
@@ -20,33 +21,6 @@ import (
 	"net/http"
 	"strings"
 )
-
-type Status int
-
-const (
-	OK Status = iota
-	ERROR
-)
-
-const (
-	IconEmoji      string = ":robot_face:"
-	HealthyEmoji   string = ":good:"
-	UnhealthyEmoji string = ":unhealthy:"
-)
-
-type SlackInfo struct {
-	url             string
-	channel         string
-	userName        string
-	notifyUserNames []string
-}
-
-type SlackPayload struct {
-	Channel   string `json:"channel"`
-	UserName  string `json:"username"`
-	Text      string `json:"text"`
-	IconEmoji string `json:"icon_emoji"`
-}
 
 func main() {
 	const usage = `
@@ -109,6 +83,9 @@ Options:
 	slackInfo.userName = utils.ArgumentMust(d, "--slack-username")
 	slackInfo.notifyUserNames = strings.Split(utils.ArgumentMust(d, "--slack-notify-usernames"), ",")
 
+	badSlaves = make(map[string]int, 1000)
+	badProxies = make(map[string]int, 10)
+
 	client := topom.NewApiClient(dashboard)
 
 	t, err := client.Model()
@@ -134,9 +111,43 @@ Options:
 			hc.Maintains(client, interval*10, prodcutAuth)
 		}
 
+		// remove proxies&slaves offlined manually
+		hc.RemoveOfflinedProxies()
+		hc.RemoveOfflinedSlaves()
+
 		time.Sleep(time.Second * time.Duration(interval))
 	}
 }
+
+type Status int
+
+const (
+	OK Status = iota
+	ERROR
+)
+
+const (
+	IconEmoji      string = ":robot_face:"
+	HealthyEmoji   string = ":good:"
+	UnhealthyEmoji string = ":unhealthy:"
+)
+
+type SlackInfo struct {
+	url             string
+	channel         string
+	userName        string
+	notifyUserNames []string
+}
+
+type SlackPayload struct {
+	Channel   string `json:"channel"`
+	UserName  string `json:"username"`
+	Text      string `json:"text"`
+	IconEmoji string `json:"icon_emoji"`
+}
+
+var badSlaves map[string]int
+var badProxies map[string]int
 
 const (
 	CodeAlive = iota + 100
@@ -300,8 +311,6 @@ func (hc *HealthyChecker) Maintains(client *topom.ApiClient, maxdown int, auth s
 	for _, p := range hc.Proxy.Models {
 		switch hc.pstatus[p.Token] {
 		case CodeError, CodeTimeout, CodeMissing:
-			sendSlackMessage(hc.slackInfo, ERROR,
-				fmt.Sprintf("proxy is broken, product name:%s, addr:%s, token:%s, code:%s", p.ProductName, p.ProxyAddr, p.Token, codeMapping[hc.pstatus[p.Token]]))
 			/*
 				log.Warnf("try to remove proxy-[%s]", p.AdminAddr)
 				if err := client.RemoveProxy(p.Token, true); err != nil {
@@ -311,7 +320,9 @@ func (hc *HealthyChecker) Maintains(client *topom.ApiClient, maxdown int, auth s
 				log.Warnf("try to remove proxy done.")
 				return
 			*/
+			hc.AddBadProxy(p, hc.pstatus)
 		default:
+			hc.RecoverProxy(p, hc.pstatus)
 			continue
 		}
 	}
@@ -364,10 +375,9 @@ Groups:
 					log.Warnf("slave %s master link down", x.Addr)
 			*/
 			case CodeError, CodeMissing, CodeTimeout, CodeSyncError, CodeSyncBroken:
-				msg := fmt.Sprintf("codis server(slave) is broken, group:%d, addr:%s, code:%s", g.Id, x.Addr, codeMapping[hc.sstatus[x.Addr]])
-				log.Warnf(msg)
-				sendSlackMessage(hc.slackInfo, ERROR, msg)
+				hc.AddBadSlave(x, hc.sstatus)
 			default:
+				hc.RecoverBadSlave(x, hc.sstatus)
 				continue
 			}
 		}
@@ -491,4 +501,70 @@ func sendSlackMessage(slackInfo *SlackInfo, status Status, message string) {
 		return
 	}
 	log.Infof("response body:%s", string(body))
+}
+
+func (hc *HealthyChecker) AddBadProxy(p *models.Proxy, pstatus map[string]int) {
+	if _, exit := badProxies[p.ProxyAddr]; !exit {
+		badProxies[p.ProxyAddr] = 1
+		sendSlackMessage(hc.slackInfo, ERROR,
+			fmt.Sprintf("proxy is broken, product name:%s, addr:%s, token:%s, code:%s", p.ProductName, p.ProxyAddr, p.Token, codeMapping[pstatus[p.Token]]))
+	}
+}
+
+func (hc *HealthyChecker) RecoverProxy(p *models.Proxy, pstatus map[string]int) {
+	if _, exit := badProxies[p.ProxyAddr]; exit {
+		delete(badProxies, p.ProxyAddr)
+		sendSlackMessage(hc.slackInfo, OK,
+			fmt.Sprintf("proxy is recovered, product name:%s, addr:%s, token:%s", p.ProductName, p.ProxyAddr, p.Token))
+	}
+}
+
+func (hc *HealthyChecker) RemoveOfflinedProxies() {
+	onlineProxies := make(map[string]int, 100)
+
+	for _, p := range hc.Proxy.Models {
+		onlineProxies[p.ProxyAddr] = 1
+	}
+
+	for addr, _ := range badProxies {
+		if _, exit := onlineProxies[addr]; !exit {
+			delete(badProxies, addr)
+			sendSlackMessage(hc.slackInfo, OK, fmt.Sprintf("proxy is offlined, addr:%s", addr))
+		}
+	}
+}
+
+func (hc *HealthyChecker) AddBadSlave(s *models.GroupServer, sstatus map[string]int) {
+	if _, exit := badSlaves[s.Addr]; !exit {
+		badSlaves[s.Addr] = 1
+		msg := fmt.Sprintf("codis server(slave) is broken, addr:%s, code:%s", s.Addr, codeMapping[sstatus[s.Addr]])
+		log.Warnf(msg)
+		sendSlackMessage(hc.slackInfo, ERROR, msg)
+	}
+}
+
+func (hc *HealthyChecker) RecoverBadSlave(s *models.GroupServer, sstatus map[string]int) {
+	if _, exit := badSlaves[s.Addr]; exit {
+		delete(badSlaves, s.Addr)
+		msg := fmt.Sprintf("codis server(slave) is recovered, addr:%s", s.Addr)
+		log.Warnf(msg)
+		sendSlackMessage(hc.slackInfo, OK, msg)
+	}
+}
+
+func (hc *HealthyChecker) RemoveOfflinedSlaves() {
+	onlineSlaves := make(map[string]int, 1000)
+
+	for _, g := range hc.Group.Models {
+		for _, x := range g.Servers {
+			onlineSlaves[x.Addr] = 1
+		}
+	}
+
+	for addr, _ := range badSlaves {
+		if _, exit := onlineSlaves[addr]; !exit {
+			delete(badSlaves, addr)
+			sendSlackMessage(hc.slackInfo, OK, fmt.Sprintf("server(slave) is offlined, addr:%s", addr))
+		}
+	}
 }
